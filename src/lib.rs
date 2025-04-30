@@ -56,7 +56,7 @@
 mod connection;
 mod visitor;
 
-use std::{borrow::Cow, collections::HashMap, fmt::Display};
+use std::{borrow::Cow, collections::{HashMap, HashSet}, fmt::Display};
 
 use bytes::Bytes;
 use serde_json::{map::Map, Value};
@@ -87,8 +87,10 @@ pub struct Logger {
     line_numbers: bool,
     file_names: bool,
     module_paths: bool,
+    extra_vars_str: bool,
     spans: bool,
     sender: mpsc::Sender<Bytes>,
+    keys_to_remove: HashSet<String>,
 }
 
 impl Logger {
@@ -122,6 +124,7 @@ pub struct Builder {
     file_names: bool,
     line_numbers: bool,
     module_paths: bool,
+    extra_vars_str: bool,
     spans: bool,
     buffer: Option<usize>,
 }
@@ -135,6 +138,7 @@ impl Default for Builder {
             file_names: true,
             line_numbers: true,
             module_paths: true,
+            extra_vars_str: false,
             spans: true,
             buffer: None,
         }
@@ -189,6 +193,11 @@ impl Builder {
     /// Sets whether line numbers should be logged. Defaults to true.
     pub fn line_numbers(mut self, value: bool) -> Self {
         self.line_numbers = value;
+        self
+    }
+
+    pub fn extra_vars_str(mut self, value: bool) -> Self {
+        self.extra_vars_str = value;
         self
     }
 
@@ -252,13 +261,22 @@ impl Builder {
             receiver: ReceiverStream::new(receiver),
             conn,
         };
+        let mut keys_to_remove: HashSet<String> = HashSet::new();
+        for (key, _) in base_object.iter() {
+            keys_to_remove.insert(key.to_string());
+        }
+        for key in ["_file", "_line", "_module_path", "host", "level", "short_message", "message", "version"] {
+            keys_to_remove.insert(key.to_string());
+        }
         let logger = Logger {
             base_object,
             file_names: self.file_names,
             line_numbers: self.line_numbers,
             module_paths: self.module_paths,
             spans: self.spans,
+            extra_vars_str: self.extra_vars_str,
             sender,
+            keys_to_remove,
         };
 
         Ok((logger, handle))
@@ -516,10 +534,20 @@ where
         event.record(&mut add_field_visitor);
 
         // Serialize
-        let object = object
+        let mut object: Map<String, Value> = object
             .into_iter()
             .map(|(key, value)| (key.to_string(), value))
             .collect();
+        if self.extra_vars_str {
+            let mut extra_vars: Map<String, Value> = Map::new();
+            for (key, val) in object.iter() {
+                if !self.keys_to_remove.contains(key) {
+                    extra_vars.insert(key.strip_prefix("_").unwrap_or(key).to_string(), val.clone());
+                }
+            }
+            let v: Value = serde_json::to_value(&extra_vars).unwrap();
+            object.insert("extra_vars".to_string(), v);
+        }
         let final_object = Value::Object(object);
         let mut raw = serde_json::to_vec(&final_object).unwrap(); // This is safe
         raw.push(0);
